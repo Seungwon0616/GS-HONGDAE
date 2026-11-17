@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>계좌이체 내역 관리</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#14181f;--sub:#5d6675;--brand:#0b5fff;--brand-fg:#fff;--danger:#d32f2f;--line:#dfe3ea}
+@media (prefers-color-scheme:dark){:root{--bg:#10131a;--card:#181d27;--fg:#f1f3f7;--sub:#9aa3b2;--brand:#4d8dff;--brand-fg:#06101f;--danger:#ff6b63;--line:#262c38}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Noto Sans KR","Malgun Gothic",sans-serif;padding-bottom:90px}
+header{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:max(env(safe-area-inset-top),14px) 16px 14px;position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);z-index:5}
+h1{font-size:18px;margin:0}
+button{font:inherit;cursor:pointer;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--fg);padding:9px 14px}
+button.primary{background:var(--brand);color:var(--brand-fg);border-color:transparent;font-weight:600}
+button.danger{background:var(--danger);color:#fff;border-color:transparent;font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+button:focus-visible,input:focus-visible{outline:3px solid var(--brand);outline-offset:2px}
+.wrap{max-width:1000px;margin:0 auto;padding:16px}
+#login{max-width:360px;margin:12vh auto;display:flex;flex-direction:column;gap:12px}
+#login h1{font-size:24px;text-align:center;margin-bottom:6px}
+input[type=email],input[type=password]{font:inherit;padding:13px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+.err{color:var(--danger);font-size:14px;min-height:20px}
+.stats{display:flex;flex-wrap:wrap;align-items:center;gap:10px;color:var(--sub);font-size:14px;margin-bottom:6px}
+.day{margin-top:22px}
+.dayhead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}
+.dayhead h2{font-size:17px;margin:0}.dayhead small{color:var(--sub);font-weight:400;margin-left:6px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.item{position:relative;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.item img{display:block;width:100%;aspect-ratio:3/4;object-fit:cover;background:var(--line);cursor:zoom-in}
+.item .meta{display:flex;justify-content:space-between;padding:7px 9px;font-size:12.5px;color:var(--sub)}
+.item input{position:absolute;top:8px;left:8px;width:24px;height:24px;accent-color:var(--brand)}
+.item.sel{outline:3px solid var(--danger)}
+#bulk{position:fixed;left:0;right:0;bottom:0;padding:12px 16px max(env(safe-area-inset-bottom),12px);background:var(--card);border-top:1px solid var(--line);display:none;justify-content:center;align-items:center;gap:12px;z-index:6}
+#viewer{position:fixed;inset:0;background:rgba(0,0,0,.9);display:none;align-items:center;justify-content:center;z-index:10;padding:16px}
+#viewer img{max-width:100%;max-height:100%;object-fit:contain}
+.empty{text-align:center;color:var(--sub);padding:60px 0}
+</style>
+</head>
+<body>
+<section id="login" hidden>
+  <h1>관리자 로그인</h1>
+  <input id="em" type="email" placeholder="이메일" autocomplete="username">
+  <input id="pw" type="password" placeholder="비밀번호" autocomplete="current-password">
+  <button id="go" class="primary">로그인</button>
+  <div id="lerr" class="err"></div>
+</section>
+
+<section id="app" hidden>
+  <header><h1>계좌이체 내역</h1><div><span id="who" style="color:var(--sub);font-size:13px;margin-right:8px"></span><button id="out">로그아웃</button></div></header>
+  <div class="wrap">
+    <div class="stats"><span id="count"></span><button id="calc">전체 용량 계산</button><span id="total"></span></div>
+    <div id="days"></div>
+    <div style="text-align:center;margin-top:24px"><button id="more" hidden>이전 날짜 더 보기</button></div>
+  </div>
+  <div id="bulk"><span id="selN"></span><button id="clr">선택 해제</button><button id="del" class="danger">선택 삭제</button></div>
+</section>
+<div id="viewer"><img alt="원본 보기"></div>
+
+<script>
+// ▼ index.html 과 동일한 값을 넣으세요
+const SUPABASE_URL = "https://rzctfllcogksodqvyfvo.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_z34EmNDU8uE7ZHziHw5RgQ_JjB1FW1E";
+const BUCKET = "transfers", DAYS_PER_PAGE = 5;
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const $ = id => document.getElementById(id);
+const store = sb.storage.from(BUCKET);
+let role = null, folders = [], loaded = 0, selected = new Set(), photoCount = 0, bytesLoaded = 0;
+
+const fmt = b => b >= 1048576 ? (b/1048576).toFixed(1)+" MB" : Math.max(1,Math.round(b/1024))+" KB";
+const timeOf = n => { const m = n.match(/^(\d\d)(\d\d)(\d\d)-/); return m ? `${m[1]}:${m[2]}:${m[3]}` : ""; };
+const dow = d => "일월화수목금토"[new Date(d+"T00:00:00+09:00").getDay()];
+
+async function boot(){
+  const {data:{session}} = await sb.auth.getSession();
+  if(!session){ show("login"); return; }
+  const {data, error} = await sb.rpc("my_role");
+  role = error ? null : data;
+  if(!role){ await sb.auth.signOut(); show("login"); $("lerr").textContent = "열람 권한이 없는 계정입니다. 관리자에게 등록을 요청하세요."; return; }
+  $("who").textContent = session.user.email + (role === "admin" ? " (관리자)" : " (열람 전용)");
+  show("app"); await loadFolders();
+}
+function show(w){ $("login").hidden = w !== "login"; $("app").hidden = w !== "app"; }
+
+$("go").onclick = async () => {
+  $("lerr").textContent = "";
+  const {error} = await sb.auth.signInWithPassword({email:$("em").value.trim(), password:$("pw").value});
+  if(error){ $("lerr").textContent = "이메일 또는 비밀번호가 올바르지 않습니다."; return; }
+  boot();
+};
+$("pw").addEventListener("keydown", e => { if(e.key === "Enter") $("go").click(); });
+$("out").onclick = async () => { await sb.auth.signOut(); location.reload(); };
+
+async function loadFolders(){
+  const {data, error} = await store.list("", {limit:1000, sortBy:{column:"name", order:"desc"}});
+  if(error){ alert("목록을 불러오지 못했습니다: " + error.message); return; }
+  folders = data.filter(x => !x.id).map(x => x.name).sort().reverse();
+  $("days").innerHTML = ""; loaded = 0; photoCount = 0; bytesLoaded = 0; selected.clear(); updateBulk();
+  if(!folders.length){ $("days").innerHTML = '<div class="empty">아직 업로드된 사진이 없습니다.</div>'; $("more").hidden = true; stats(); return; }
+  await loadMore();
+}
+async function listDay(d){
+  const {data, error} = await store.list(d, {limit:1000, sortBy:{column:"name", order:"desc"}});
+  if(error) throw error;
+  return data.filter(x => x.id);
+}
+async function loadMore(){
+  $("more").disabled = true;
+  const batch = folders.slice(loaded, loaded + DAYS_PER_PAGE); loaded += batch.length;
+  for(const d of batch){
+    const files = await listDay(d);
+    if(!files.length) continue;
+    const paths = files.map(f => `${d}/${f.name}`);
+    const {data:urls} = await store.createSignedUrls(paths, 3600);
+    const sec = document.createElement("div"); sec.className = "day";
+    const dayBytes = files.reduce((s,f)=>s+(f.metadata?.size||0),0);
+    sec.innerHTML = `<div class="dayhead"><h2>${d} (${dow(d)})<small>${files.length}장 · ${fmt(dayBytes)}</small></h2>${role==="admin"?'<button class="selday">이 날짜 전체 선택</button>':""}</div><div class="grid"></div>`;
+    const grid = sec.querySelector(".grid");
+    files.forEach((f,i) => {
+      const p = paths[i], u = urls?.[i]?.signedUrl || "", size = f.metadata?.size || 0;
+      photoCount++; bytesLoaded += size;
+      const el = document.createElement("div"); el.className = "item"; el.dataset.path = p;
+      el.innerHTML = `${role==="admin"?'<input type="checkbox" aria-label="선택">':""}<img loading="lazy" alt="이체내역 ${timeOf(f.name)}"><div class="meta"><span>${timeOf(f.name)}</span><span>${fmt(size)}</span></div>`;
+      const img = el.querySelector("img"); img.src = u; img.onclick = () => openViewer(u);
+      const cb = el.querySelector("input");
+      if(cb) cb.onchange = () => { cb.checked ? selected.add(p) : selected.delete(p); el.classList.toggle("sel", cb.checked); updateBulk(); };
+      grid.appendChild(el);
+    });
+    const sb2 = sec.querySelector(".selday");
+    if(sb2) sb2.onclick = () => { const boxes = [...grid.querySelectorAll("input")]; const all = boxes.every(b=>b.checked); boxes.forEach(b => { b.checked = !all; b.onchange(); }); };
+    $("days").appendChild(sec);
+  }
+  $("more").hidden = loaded >= folders.length; $("more").disabled = false; stats();
+}
+function stats(){ $("count").textContent = `불러온 사진 ${photoCount}장 · ${fmt(bytesLoaded)}`; }
+$("more").onclick = loadMore;
+
+$("calc").onclick = async () => {
+  $("calc").disabled = true; $("total").textContent = "계산 중…";
+  try{ let n = 0, b = 0; for(const d of folders){ for(const f of await listDay(d)){ n++; b += f.metadata?.size || 0; } }
+    $("total").textContent = `전체 ${n}장 · ${fmt(b)} 사용 중 (무료 플랜 저장 한도 1GB)`;
+  }catch(e){ $("total").textContent = "계산 실패"; }
+  $("calc").disabled = false;
+};
+
+function updateBulk(){ $("bulk").style.display = selected.size ? "flex" : "none"; $("selN").textContent = `${selected.size}장 선택됨`; }
+$("clr").onclick = () => document.querySelectorAll(".item input:checked").forEach(b => { b.checked = false; b.onchange(); });
+$("del").onclick = async () => {
+  const paths = [...selected]; if(!paths.length) return;
+  if(!confirm(`선택한 사진 ${paths.length}장을 영구 삭제할까요?\n삭제하면 복구할 수 없습니다.`)) return;
+  $("del").disabled = true;
+  const {data, error} = await store.remove(paths);
+  $("del").disabled = false;
+  if(error){ alert("삭제 실패: " + error.message); return; }
+  if((data?.length || 0) < paths.length) alert("일부 사진은 삭제되지 않았습니다. 관리자 권한을 확인하세요.");
+  await loadFolders();
+};
+
+function openViewer(u){ if(!u) return; const v = $("viewer"); v.querySelector("img").src = u; v.style.display = "flex"; }
+$("viewer").onclick = () => $("viewer").style.display = "none";
+document.addEventListener("keydown", e => { if(e.key === "Escape") $("viewer").style.display = "none"; });
+
+boot();
+</script>
+</body>
+</html>
